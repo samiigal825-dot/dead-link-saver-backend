@@ -7,6 +7,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const tls = require('tls');
 const net = require('net');
+const crypto = require('crypto');
 const nodemailer = require('nodemailer');
 
 const app = express();
@@ -79,6 +80,11 @@ pool.query('SELECT NOW()', (err, res) => {
 // ==========================================
 // HELPERS
 // ==========================================
+
+// SHA-256 hash helper for API keys
+const hashApiKey = (key) => {
+  return crypto.createHash('sha256').update(key).digest('hex');
+};
 
 // Helper to check SSL certificate expiry for HTTPS links
 const getSslCertificateExpiry = (urlStr) => {
@@ -237,9 +243,34 @@ const sendEmailAlert = async (emailAddress, linkName, linkUrl, statusCode, error
 // MIDDLEWARES
 // ==========================================
 
-const authenticateToken = (req, res, next) => {
+const authenticateToken = async (req, res, next) => {
   const authHeader = req.headers['authorization'];
+  const apiKeyHeader = req.headers['x-api-key'];
   const token = authHeader && authHeader.split(' ')[1];
+
+  // Detect API key from X-API-Key header or Bearer ls_live_ prefix
+  const apiKey = apiKeyHeader || (token && token.startsWith('ls_live_') ? token : null);
+
+  if (apiKey) {
+    try {
+      const keyHash = hashApiKey(apiKey);
+      const result = await pool.query(
+        `SELECT ak.id as key_id, ak.user_id, u.email, u.subscription_tier as tier
+         FROM api_keys ak JOIN users u ON ak.user_id = u.id
+         WHERE ak.key_hash = $1`, [keyHash]
+      );
+      if (result.rows.length === 0) {
+        return res.status(401).json({ error: 'Invalid API key' });
+      }
+      // Update last_used_at timestamp
+      pool.query('UPDATE api_keys SET last_used_at = CURRENT_TIMESTAMP WHERE id = $1', [result.rows[0].key_id]).catch(() => {});
+      req.user = { userId: result.rows[0].user_id, email: result.rows[0].email, tier: result.rows[0].tier };
+      return next();
+    } catch (err) {
+      console.error('API Key auth error:', err);
+      return res.status(500).json({ error: 'Internal Server Error' });
+    }
+  }
 
   if (!token) {
     return res.status(401).json({ error: 'Access token required' });
@@ -327,6 +358,217 @@ app.get('/api/auth/me', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Auth details fetch error:', error);
     res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+// ==========================================
+// API KEY MANAGEMENT (PROTECTED)
+// ==========================================
+
+// List API keys for the authenticated user
+app.get('/api/auth/apikeys', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT id, key_hint, name, created_at, last_used_at FROM api_keys WHERE user_id = $1 ORDER BY created_at DESC',
+      [req.user.userId]
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Error fetching API keys:', error);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+// Generate a new API key
+app.post('/api/auth/apikeys', authenticateToken, async (req, res) => {
+  const { name } = req.body;
+  const keyName = name || 'Default API Key';
+
+  try {
+    // Check key limit (max 5 per user)
+    const countRes = await pool.query('SELECT COUNT(*) FROM api_keys WHERE user_id = $1', [req.user.userId]);
+    if (parseInt(countRes.rows[0].count) >= 5) {
+      return res.status(400).json({ error: 'Maximum of 5 API keys per account. Revoke an existing key first.' });
+    }
+
+    // Generate cryptographically secure key
+    const rawKey = 'ls_live_' + crypto.randomBytes(24).toString('hex');
+    const keyHash = hashApiKey(rawKey);
+    const keyHint = rawKey.substring(0, 12) + '...';
+
+    await pool.query(
+      'INSERT INTO api_keys (user_id, key_hash, key_hint, name) VALUES ($1, $2, $3, $4)',
+      [req.user.userId, keyHash, keyHint, keyName]
+    );
+
+    // Return the raw key ONCE — it will never be retrievable again
+    res.status(201).json({
+      message: 'API key generated successfully. Copy it now — it will not be shown again.',
+      api_key: rawKey,
+      hint: keyHint,
+      name: keyName
+    });
+  } catch (error) {
+    console.error('Error generating API key:', error);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+// Revoke/Delete an API key
+app.delete('/api/auth/apikeys/:id', authenticateToken, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const result = await pool.query(
+      'DELETE FROM api_keys WHERE id = $1 AND user_id = $2 RETURNING *',
+      [id, req.user.userId]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'API key not found or unauthorized' });
+    }
+    res.json({ message: 'API key revoked successfully' });
+  } catch (error) {
+    console.error('Error revoking API key:', error);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+// ==========================================
+// PROGRAMMATIC REST API v1 (API KEY / JWT)
+// ==========================================
+
+// GET /api/v1/monitors — List all monitors
+app.get('/api/v1/monitors', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT id, name, url, status, check_type, check_interval, last_checked, response_time, is_active, ssl_expires_at, created_at FROM links WHERE user_id = $1 ORDER BY created_at DESC',
+      [req.user.userId]
+    );
+    res.json({ success: true, monitors: result.rows });
+  } catch (error) {
+    console.error('API v1 list monitors error:', error);
+    res.status(500).json({ success: false, error: 'Internal Server Error' });
+  }
+});
+
+// POST /api/v1/monitors — Create a new monitor
+app.post('/api/v1/monitors', authenticateToken, async (req, res) => {
+  const {
+    name, url,
+    check_type = 'HTTP', check_interval = 10,
+    keyword = null, port = null,
+    slack_webhook_url = null, telegram_bot_token = null,
+    telegram_chat_id = null, email_alert = null
+  } = req.body;
+
+  if (!name || !url) {
+    return res.status(400).json({ success: false, error: 'name and url are required' });
+  }
+
+  if (check_type !== 'PORT') {
+    try { new URL(url); } catch (err) {
+      return res.status(400).json({ success: false, error: 'Invalid URL format. Must include protocol (e.g. https://)' });
+    }
+  }
+
+  try {
+    const userRes = await pool.query('SELECT subscription_tier FROM users WHERE id = $1', [req.user.userId]);
+    const tier = userRes.rows[0]?.subscription_tier || 'FREE';
+
+    const countRes = await pool.query('SELECT COUNT(*) FROM links WHERE user_id = $1', [req.user.userId]);
+    const monitorCount = parseInt(countRes.rows[0].count);
+
+    let maxMonitors = 3;
+    if (tier === 'PRO') maxMonitors = 20;
+    if (tier === 'ENTERPRISE') maxMonitors = 9999;
+
+    if (monitorCount >= maxMonitors) {
+      return res.status(400).json({ success: false, error: `Monitor limit reached (${maxMonitors}). Upgrade your plan.` });
+    }
+
+    let minInterval = 10;
+    if (tier === 'PRO' || tier === 'ENTERPRISE') minInterval = 1;
+    if (parseInt(check_interval) < minInterval) {
+      return res.status(400).json({ success: false, error: `Minimum interval for ${tier} tier is ${minInterval} minutes.` });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO links (name, url, user_id, status, check_type, check_interval, keyword, port, slack_webhook_url, telegram_bot_token, telegram_chat_id, email_alert)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *`,
+      [name, url, req.user.userId, 'PENDING', check_type, parseInt(check_interval), keyword, port ? parseInt(port) : null, slack_webhook_url, telegram_bot_token, telegram_chat_id, email_alert]
+    );
+
+    res.status(201).json({ success: true, monitor: result.rows[0] });
+  } catch (error) {
+    console.error('API v1 create monitor error:', error);
+    res.status(500).json({ success: false, error: 'Internal Server Error' });
+  }
+});
+
+// GET /api/v1/monitors/:id — Get monitor details with recent logs
+app.get('/api/v1/monitors/:id', authenticateToken, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const monitorRes = await pool.query('SELECT * FROM links WHERE id = $1 AND user_id = $2', [id, req.user.userId]);
+    if (monitorRes.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Monitor not found' });
+    }
+    const logsRes = await pool.query(
+      'SELECT id, status_code, error_message, response_time, detected_at FROM incident_logs WHERE link_id = $1 ORDER BY detected_at DESC LIMIT 20',
+      [id]
+    );
+    res.json({ success: true, monitor: monitorRes.rows[0], recent_incidents: logsRes.rows });
+  } catch (error) {
+    console.error('API v1 get monitor error:', error);
+    res.status(500).json({ success: false, error: 'Internal Server Error' });
+  }
+});
+
+// PATCH /api/v1/monitors/:id — Update a monitor
+app.patch('/api/v1/monitors/:id', authenticateToken, async (req, res) => {
+  const { id } = req.params;
+  const updates = req.body;
+  const allowedUpdates = ['name', 'url', 'check_type', 'check_interval', 'keyword', 'port', 'slack_webhook_url', 'telegram_bot_token', 'telegram_chat_id', 'email_alert', 'is_active'];
+  const updateFields = [];
+  const queryValues = [id, req.user.userId];
+  let valIdx = 3;
+
+  for (let key of allowedUpdates) {
+    if (updates[key] !== undefined) {
+      updateFields.push(`${key} = $${valIdx}`);
+      queryValues.push(updates[key]);
+      valIdx++;
+    }
+  }
+
+  if (updateFields.length === 0) {
+    return res.status(400).json({ success: false, error: 'No valid update parameters provided' });
+  }
+
+  try {
+    const queryText = `UPDATE links SET ${updateFields.join(', ')} WHERE id = $1 AND user_id = $2 RETURNING *`;
+    const result = await pool.query(queryText, queryValues);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Monitor not found or unauthorized' });
+    }
+    res.json({ success: true, monitor: result.rows[0] });
+  } catch (error) {
+    console.error('API v1 update monitor error:', error);
+    res.status(500).json({ success: false, error: 'Internal Server Error' });
+  }
+});
+
+// DELETE /api/v1/monitors/:id — Delete a monitor
+app.delete('/api/v1/monitors/:id', authenticateToken, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const result = await pool.query('DELETE FROM links WHERE id = $1 AND user_id = $2 RETURNING id, name, url', [id, req.user.userId]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Monitor not found or unauthorized' });
+    }
+    res.json({ success: true, message: 'Monitor deleted successfully', deleted: result.rows[0] });
+  } catch (error) {
+    console.error('API v1 delete monitor error:', error);
+    res.status(500).json({ success: false, error: 'Internal Server Error' });
   }
 });
 
