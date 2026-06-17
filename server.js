@@ -115,7 +115,7 @@ const sendTelegramAlert = async (linkName, linkUrl, statusCode, errorMessage) =>
   }
 
   const message = `🚨 *Dead Link Saver Alert* 🚨\n\n` +
-                  `Campaign: *${linkName}*\n` +
+                  `Link Name: *${linkName}*\n` +
                   `URL: ${linkUrl}\n` +
                   `Status Code: *${statusCode || 'N/A'}*\n` +
                   `Error: ${errorMessage || 'Unknown Network Error'}\n` +
