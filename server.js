@@ -133,6 +133,30 @@ const sendTelegramAlert = async (linkName, linkUrl, statusCode, errorMessage) =>
   }
 };
 
+// Optional Slack notification function
+const sendSlackAlert = async (linkName, linkUrl, statusCode, errorMessage) => {
+  const webhookUrl = process.env.SLACK_WEBHOOK_URL;
+
+  if (!webhookUrl) {
+    console.log('Slack alerts skipped: SLACK_WEBHOOK_URL not configured.');
+    return;
+  }
+
+  const message = `🚨 *Dead Link Saver Alert* 🚨\n\n` +
+                  `• *Link Name:* ${linkName}\n` +
+                  `• *URL:* ${linkUrl}\n` +
+                  `• *Status Code:* ${statusCode || 'N/A'}\n` +
+                  `• *Error:* ${errorMessage || 'Unknown Network Error'}\n` +
+                  `• *Time:* ${new Date().toISOString()}`;
+
+  try {
+    await axios.post(webhookUrl, { text: message });
+    console.log(`Slack alert sent for ${linkName}`);
+  } catch (error) {
+    console.error('Failed to send Slack alert:', error.message);
+  }
+};
+
 // 5. GET /api/cron/check - Cron route to ping links
 app.get('/api/cron/check', async (req, res) => {
   const secret = req.query.secret;
@@ -189,7 +213,7 @@ app.get('/api/cron/check', async (req, res) => {
         [status, link.id]
       );
 
-      // If link goes down, log it to incident_logs and send Telegram alert
+      // If link goes down, log it to incident_logs and send alerts
       if (status === 'DOWN') {
         summary.failed++;
         
@@ -199,8 +223,9 @@ app.get('/api/cron/check', async (req, res) => {
           [link.id, statusCode, errorMessage]
         );
 
-        // Send Telegram alert
+        // Send alerts
         await sendTelegramAlert(link.name, link.url, statusCode, errorMessage);
+        await sendSlackAlert(link.name, link.url, statusCode, errorMessage);
       }
 
       summary.details.push({
