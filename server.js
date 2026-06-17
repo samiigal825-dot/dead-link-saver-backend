@@ -15,6 +15,48 @@ const JWT_SECRET = process.env.JWT_SECRET || 'linksentinel_super_jwt_secret_phra
 
 // Middleware
 app.use(cors());
+
+// Stripe Webhook Endpoint (MUST be before express.json() for raw body parsing)
+app.post('/api/billing/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+  if (!process.env.STRIPE_SECRET_KEY || !webhookSecret) {
+    console.log('Stripe webhook received but credentials are not configured.');
+    return res.status(400).send('Webhook secret missing');
+  }
+
+  const stripeObj = require('stripe')(process.env.STRIPE_SECRET_KEY);
+  let event;
+
+  try {
+    event = stripeObj.webhooks.constructEvent(req.body, sig, webhookSecret);
+  } catch (err) {
+    console.error('Webhook signature verification failed:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  if (event.type === 'checkout.session.completed') {
+    const session = event.data.object;
+    const userId = session.metadata.userId;
+    const tier = session.metadata.tier;
+    const customerId = session.customer;
+    const subscriptionId = session.subscription;
+
+    try {
+      await pool.query(
+        'UPDATE users SET subscription_tier = $1, subscription_status = $2, stripe_customer_id = $3, stripe_subscription_id = $4 WHERE id = $5',
+        [tier, 'ACTIVE', customerId, subscriptionId, parseInt(userId)]
+      );
+      console.log(`User ${userId} upgraded to ${tier} via Stripe Webhook.`);
+    } catch (dbErr) {
+      console.error('DB update in webhook failed:', dbErr);
+    }
+  }
+
+  res.json({ received: true });
+});
+
 app.use(express.json());
 
 // Neon DB connection pool
@@ -298,14 +340,51 @@ app.post('/api/billing/subscribe', authenticateToken, async (req, res) => {
     return res.status(400).json({ error: 'Invalid subscription tier' });
   }
 
+  // If tier is FREE, handle downgrade directly
+  if (tier === 'FREE') {
+    try {
+      await pool.query(
+        'UPDATE users SET subscription_tier = $1, subscription_status = $2 WHERE id = $3',
+        [tier, 'ACTIVE', req.user.userId]
+      );
+      return res.json({ message: `Successfully updated subscription to ${tier}`, tier });
+    } catch (error) {
+      console.error(error);
+      return res.status(500).json({ error: 'Internal Server Error' });
+    }
+  }
+
+  const stripeSecret = process.env.STRIPE_SECRET_KEY;
+  const priceId = tier === 'PRO' ? process.env.STRIPE_PRICE_PRO : process.env.STRIPE_PRICE_ENTERPRISE;
+
+  if (stripeSecret && priceId) {
+    try {
+      const stripeObj = require('stripe')(stripeSecret);
+      const session = await stripeObj.checkout.sessions.create({
+        mode: 'subscription',
+        payment_method_types: ['card'],
+        line_items: [{ price: priceId, quantity: 1 }],
+        success_url: `${req.headers.origin}/?billing_success=true&tier=${tier}`,
+        cancel_url: `${req.headers.origin}/?billing_canceled=true`,
+        metadata: {
+          userId: req.user.userId.toString(),
+          tier: tier
+        }
+      });
+      return res.json({ url: session.url, message: 'Redirecting to Stripe' });
+    } catch (stripeErr) {
+      console.error('Stripe Checkout Error:', stripeErr);
+      return res.status(500).json({ error: 'Failed to create Stripe Checkout session' });
+    }
+  }
+
+  // Fallback to Simulation Mode if no Stripe config is found in environments
   try {
-    // Dynamically upgrade/downgrade subscription in the database (Mock Checkout Success)
     await pool.query(
       'UPDATE users SET subscription_tier = $1, subscription_status = $2 WHERE id = $3',
       [tier, 'ACTIVE', req.user.userId]
     );
-
-    res.json({ message: `Successfully updated subscription to ${tier}`, tier });
+    res.json({ message: `Successfully updated subscription to ${tier} (Simulated)`, tier });
   } catch (error) {
     console.error('Billing update error:', error);
     res.status(500).json({ error: 'Internal Server Error' });
