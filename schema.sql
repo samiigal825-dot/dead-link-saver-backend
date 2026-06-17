@@ -1,4 +1,4 @@
--- Neon DB Schema for Dead Link Saver
+-- Neon DB Schema for LinkSentinel
 
 -- 1. Users Table
 CREATE TABLE IF NOT EXISTS users (
@@ -13,8 +13,16 @@ CREATE TABLE IF NOT EXISTS links (
     user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
     url TEXT NOT NULL,
     name VARCHAR(255) NOT NULL,
-    status VARCHAR(50) DEFAULT 'PENDING' NOT NULL, -- PENDING, UP, DOWN
+    status VARCHAR(50) DEFAULT 'PENDING' NOT NULL, -- PENDING, UP, DOWN, PAUSED
     last_checked TIMESTAMP WITH TIME ZONE,
+    response_time INTEGER,
+    history JSONB DEFAULT '[]'::jsonb,
+    is_active BOOLEAN DEFAULT TRUE NOT NULL,
+    check_interval INTEGER DEFAULT 10 NOT NULL, -- in minutes
+    ssl_expires_at TIMESTAMP WITH TIME ZONE,
+    check_type VARCHAR(50) DEFAULT 'HTTP' NOT NULL, -- HTTP, SSL_ONLY, PORT, KEYWORD
+    keyword VARCHAR(255),
+    port INTEGER,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -24,6 +32,7 @@ CREATE TABLE IF NOT EXISTS incident_logs (
     link_id INTEGER REFERENCES links(id) ON DELETE CASCADE NOT NULL,
     status_code INTEGER,
     error_message TEXT,
+    response_time INTEGER,
     detected_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
