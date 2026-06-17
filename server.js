@@ -183,6 +183,7 @@ app.get('/api/cron/check', async (req, res) => {
       let status = 'UP';
       let statusCode = null;
       let errorMessage = null;
+      const startTime = Date.now();
 
       try {
         // Ping url with 5 second timeout
@@ -207,20 +208,38 @@ app.get('/api/cron/check', async (req, res) => {
         }
       }
 
+      const responseTime = Date.now() - startTime;
+
+      // Update rolling history array (max 20 checks)
+      let history = [];
+      try {
+        history = Array.isArray(link.history) ? link.history : JSON.parse(link.history || '[]');
+      } catch (e) {
+        history = [];
+      }
+      history.push({
+        status,
+        latency: responseTime,
+        time: new Date().toISOString()
+      });
+      if (history.length > 20) {
+        history = history.slice(-20);
+      }
+
       // Update link check details in database
       await pool.query(
-        'UPDATE links SET status = $1, last_checked = CURRENT_TIMESTAMP WHERE id = $2',
-        [status, link.id]
+        'UPDATE links SET status = $1, last_checked = CURRENT_TIMESTAMP, response_time = $2, history = $3 WHERE id = $4',
+        [status, responseTime, JSON.stringify(history), link.id]
       );
 
       // If link goes down, log it to incident_logs and send alerts
       if (status === 'DOWN') {
         summary.failed++;
         
-        // Log the incident
+        // Log the incident with response_time
         await pool.query(
-          'INSERT INTO incident_logs (link_id, status_code, error_message) VALUES ($1, $2, $3)',
-          [link.id, statusCode, errorMessage]
+          'INSERT INTO incident_logs (link_id, status_code, error_message, response_time) VALUES ($1, $2, $3, $4)',
+          [link.id, statusCode, errorMessage, responseTime]
         );
 
         // Send alerts
@@ -234,6 +253,7 @@ app.get('/api/cron/check', async (req, res) => {
         url: link.url,
         status,
         statusCode,
+        responseTime,
         error: errorMessage
       });
     }
